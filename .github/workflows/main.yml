@@ -1,0 +1,125 @@
+name: CI
+on: [push]
+jobs:
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+    - name: Draft Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        draft: true
+        prerelease: false
+    - name: Dump upload_url into file
+      run: echo "${{ steps.create_release.outputs.upload_url }}" > upload_url
+    - name: Archive upload_url
+      uses: actions/upload-artifact@v1.0.0
+      with:
+        name: upload_url
+        path: upload_url
+  build:
+    name: ${{ matrix.name }}-${{ matrix.platform }}-${{ matrix.configuration }}-build
+    needs: prepare
+    if: success() || !startsWith(github.ref, 'refs/tags/')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [linux, windows]
+        configuration: [Release, Debug]
+        platform: [win32, x64]
+        include:
+        - name: linux
+          os: ubuntu-latest
+        - name: windows
+          os: windows-latest
+        exclude:
+          - name: linux
+            platform: win32
+          - name: linux
+            configuration: Debug
+    steps:
+    - name: Install GCC 9
+      if: matrix.name == 'linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y g++-9
+        echo "::set-env name=CC::gcc-9"
+        echo "::set-env name=CXX::g++-9"
+    - uses: actions/checkout@v1
+      with:
+        submodules: recursive
+    - name: Restore timestamps
+      shell: bash
+      run: |
+        git ls-tree -r --name-only HEAD | while read filename; do
+          unixtime=$(git log -1 --format="%ct" -- "${filename}")
+          touchtime=$(date -d @$unixtime +'%Y%m%d%H%M.%S')
+          touch -t ${touchtime} "${filename}"
+        done
+    - name: Build directory cache
+      uses: actions/cache@v1
+      id: cache
+      with:
+        path: build
+        key: ${{ matrix.name }}-${{ matrix.platform }}-${{ matrix.configuration }}-${{ github.sha }}
+        restore-keys: ${{ matrix.name }}-${{ matrix.platform }}-${{ matrix.configuration }}-
+    - name: Configure Cmake (windows)
+      if: matrix.name == 'windows'
+      shell: bash
+      run: |
+        echo "::set-env name=OUTPUT_PATH::build/output/${{ matrix.configuration }}"
+        mkdir -p build
+        cd build
+        cmake .. -A ${{ matrix.platform }}
+    - name: Configure Cmake (linux)
+      if: matrix.name == 'linux'
+      run: |
+        echo "::set-env name=OUTPUT_PATH::build/output"
+        mkdir -p build
+        cd build
+        cmake .. -DCMAKE_BUILD_TYPE=${{ matrix.configuration }}
+    - name: Build
+      run: cmake --build build --config ${{ matrix.configuration }}
+    - name: Pack output
+      shell: bash
+      run: |
+        mkdir pack
+        cp -r $OUTPUT_PATH pack/${{ matrix.name }}-${{ matrix.platform }}-${{ matrix.configuration }}-build
+        cp README.md LICENSE pack/${{ matrix.name }}-${{ matrix.platform }}-${{ matrix.configuration }}-build
+        cd pack
+        7z a -tzip output.zip ${{ matrix.name }}-${{ matrix.platform }}-${{ matrix.configuration }}-build
+    - name: Archive output artifacts
+      uses: actions/upload-artifact@v1.0.0
+      with:
+        name: ${{ matrix.name }}-${{ matrix.platform }}-${{ matrix.configuration }}-build
+        path: pack/${{ matrix.name }}-${{ matrix.platform }}-${{ matrix.configuration }}-build
+    - name: Test
+      shell: bash
+      run: $OUTPUT_PATH/sqfvm -a --load . -i tests/runTests.sqf
+    - name: Download upload_url artifact
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: actions/download-artifact@v1.0.0
+      with:
+        name: upload_url
+    - name: Get upload_url
+      if: startsWith(github.ref, 'refs/tags/')
+      id: get_upload_url
+      shell: bash
+      run: echo "::set-output name=upload_url::$(cat upload_url/upload_url)"
+    - name: Upload Release Assets
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: actions/upload-release-asset@v1.0.1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.get_upload_url.outputs.upload_url }}
+        asset_path: ./pack/output.zip
+        asset_name: ${{ matrix.name }}-${{ matrix.platform }}-${{ matrix.configuration }}-build.zip
+        asset_content_type: application/zip
